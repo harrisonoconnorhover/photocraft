@@ -527,13 +527,16 @@ fn decode_ifd(f: &File<'_>, dir: &Ifd, limits: &Limits) -> Result<Image, CodecEr
     // TIFF 6.0 lets any extra sample be the alpha (#1349). For RGB and CMYK the `tiff` crate
     // returns the alpha only when it is the first extra sample: otherwise it is asked for every
     // sample (as multiband gray) and the colour and alpha samples are picked here. An alpha
-    // position past the samples the file has is ignored.
+    // position past the samples the file has is an error.
     let color = match photometric {
         2 => 3,
         5 => 4,
         _ => 1,
     };
-    let alpha_at = extra.iter().position(|&e| e == 1 || e == 2).filter(|&a| (color + a as u64) < spp);
+    let alpha_at = extra.iter().position(|&e| e == 1 || e == 2);
+    if alpha_at.is_some_and(|a| color + a as u64 >= spp) {
+        return Err(err("the alpha sample is past the samples of a pixel"));
+    }
     let all_samples = palette.is_none() && matches!(photometric, 2 | 5) && alpha_at.is_some_and(|a| a > 0);
     let mut patches: Vec<(u64, Vec<u8>)> = Vec::new();
     let encode_u = |v: u64, len: usize| -> Vec<u8> {

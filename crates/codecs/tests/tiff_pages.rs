@@ -211,6 +211,48 @@ fn alpha_after_an_unspecified_extra_sample_is_kept() {
 }
 
 #[test]
+fn later_alpha_with_deflate_and_horizontal_prediction() {
+    use std::io::Write;
+    // Differences are within the same channel of the previous pixel, including extra/alpha.
+    let px = [10u8, 20, 30, 201, 128, 40, 50, 60, 202, 255, 100, 150, 200, 203, 0];
+    let mut predicted = px;
+    for i in (5..px.len()).rev() {
+        predicted[i] = px[i].wrapping_sub(px[i - 5]);
+    }
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&predicted).unwrap();
+    let mut d = Dir { entries: base(3, 1, 8, 5, 2), chunks: vec![encoder.finish().unwrap()], tiled: false };
+    d.entries.retain(|(tag, _, _)| *tag != 259);
+    d = d.tag(259, SHORT, &[8]).tag(278, LONG, &[1]).tag(317, SHORT, &[2]).tag(338, SHORT, &[0, 2]);
+    let img = decode_ok(&build(true, false, &[d], &[0]).bytes);
+    assert_eq!(img.layout(), ChannelLayout::Rgba);
+    assert_eq!(img.data(), &[10, 20, 30, 128, 40, 50, 60, 255, 100, 150, 200, 0]);
+    assert_eq!(img.warnings, []);
+}
+
+#[test]
+fn later_alpha_in_padded_tiles_survives_png_export() {
+    let px = [10u8, 20, 30, 201, 128, 40, 50, 60, 202, 255];
+    let want = [10, 20, 30, 128, 40, 50, 60, 255];
+    for planar in [false, true] {
+        let mut d = Dir { entries: base(2, 1, 8, 5, 2), chunks: tile_split(&px, 2, 1, 5, 1, 16, 16, planar), tiled: true }
+            .tag(322, SHORT, &[16])
+            .tag(323, SHORT, &[16])
+            .tag(338, SHORT, &[0, 2]);
+        if planar {
+            d = d.tag(284, SHORT, &[2]);
+        }
+        let img = decode_ok(&build(true, false, &[d], &[0]).bytes);
+        assert_eq!(img.layout(), ChannelLayout::Rgba);
+        assert_eq!(img.data(), &want);
+        let png = encode(&img, Format::Png, &EncodeOptions::default()).unwrap();
+        let back = decode_ok(&png);
+        assert_eq!(back.layout(), ChannelLayout::Rgba);
+        assert_eq!(back.data(), &want);
+    }
+}
+
+#[test]
 fn associated_alpha_is_made_straight() {
     // Premultiplied: half-transparent mid gray is stored as 64 with alpha 128.
     let px = [64u8, 128, 200, 255, 0, 0];
@@ -447,6 +489,14 @@ fn image_data_cut_off_decodes_with_a_warning() {
         }
         assert!(decode(&b.bytes).is_err());
     }
+}
+
+#[test]
+fn invalid_gray_alpha_extra_sample_is_rejected() {
+    // Gray plus one unspecified sample cannot also contain a second extra sample for alpha.
+    // #1513 must report the invalid alpha position instead of opening it as opaque Gray.
+    let d = strips(1, 1, 8, 2, 1, 1, &[100, 17]).tag(338, SHORT, &[0, 2]);
+    assert!(decode(&build(true, false, &[d], &[0]).bytes).is_err());
 }
 
 #[test]
