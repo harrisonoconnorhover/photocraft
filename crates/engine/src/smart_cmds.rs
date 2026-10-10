@@ -713,9 +713,15 @@ fn instances(doc: &Document, contents_id: SmartContentsId) -> Vec<LayerId> {
 /// Swaps shared contents, keeping each instance's transform and filters, and re-renders.
 fn set_source(s: &mut Session, p: &Value, label: &str, keep_psd: bool, make: impl FnOnce(&Metadata, &SmartSource) -> Result<SmartSource>) -> Result<Value> {
     let id = layer_param(s, p)?;
+    let doc = &s.active().ok_or(EngineError::NoDocument)?.doc;
+    let new = make(&doc.metadata, &smart(doc, id)?.source)?;
+    set_shared_source(s, id, label, keep_psd, new)
+}
+
+// Keep the shared-instance transaction out of the per-command source-builder instantiations.
+fn set_shared_source(s: &mut Session, id: LayerId, label: &str, keep_psd: bool, new: SmartSource) -> Result<Value> {
     let (parent, contents_id) = s.edit(label, |doc, _| {
         let contents_id = smart(doc, id)?.contents_id;
-        let new = make(&doc.metadata, &smart(doc, id)?.source)?;
         for instance in instances(doc, contents_id) {
             smart_mut(doc, instance)?.source = new.clone();
             if !keep_psd {
@@ -792,10 +798,11 @@ pub fn commit_child(s: &mut Session, index: usize) -> Result<bool> {
         }
         for id in ids {
             let sm = smart_mut(doc, id)?;
-            let stem = match &sm.source {
-                SmartSource::Embedded { file_name, .. } => file_name.rsplit_once('.').map_or(file_name.as_str(), |(a, _)| a).to_string(),
-                SmartSource::Linked { .. } => child.name.rsplit_once('.').map_or(child.name.as_str(), |(a, _)| a).to_string(),
+            let name = match &sm.source {
+                SmartSource::Embedded { file_name, .. } => file_name.as_str(),
+                SmartSource::Linked { .. } => child.name.as_str(),
             };
+            let stem = name.rsplit_once('.').map_or(name, |(stem, _)| stem);
             sm.source = SmartSource::Embedded { file_name: format!("{stem}.pcraft"), bytes: bytes.clone() };
             detach_psd(doc.layer_mut(id).ok_or(EngineError::NoLayer(id))?);
             refresh_or_fail(doc, id)?;
