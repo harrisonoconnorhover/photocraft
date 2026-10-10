@@ -49,7 +49,8 @@ fn assert_styles(actual: &TextLayer, expected: &TextLayer) {
 #[test]
 fn selected_type_properties_preserve_each_layers_other_attributes_and_one_history_step() {
     let (mut s, ids, raster) = fixture();
-    let cases: [(&[usize], Value, fn(&mut CharStyle)); 4] = [
+    type StyleCase<'a> = (&'a [usize], Value, fn(&mut CharStyle));
+    let cases: [StyleCase<'_>; 4] = [
         (&[0, 2], json!({"font": "New Family"}), |st| {
             st.font_family = "New Family".into();
             st.postscript_name = None;
