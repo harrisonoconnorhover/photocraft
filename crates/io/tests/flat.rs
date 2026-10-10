@@ -314,6 +314,134 @@ fn assert_colors(got: &[Vec<f32>], want: &[Vec<f32>], tol: f32, what: &str) {
     }
 }
 
+/// Both an extra empty layer and a mask require compositing instead of copying native samples.
+fn cmyk_composite_columns(depth: SampleType, masked: bool, transparent: bool) -> photocraft_doc::Document {
+    use photocraft_doc::{Layer, LayerContent, LayerMask};
+    use photocraft_raster::Surface;
+    let alpha = if transparent { [0.0, 0.5, 1.0] } else { [1.0; 3] };
+    let mut d = columns(ColorMode::Cmyk, depth, &[&[0.7, 0.1, 0.2, 0.1, alpha[0]], &[0.0, 0.5, 0.5, 0.0, alpha[1]], &[0.2, 0.4, 0.1, 0.3, alpha[2]]]);
+    d.icc_profile = Some(photocraft_cms::Builtin::CoatedCmyk.profile().to_bytes());
+    if masked {
+        let mut surface = Surface::with_default(photocraft_color::PixelFormat::new(ColorMode::Grayscale, depth, false), &[1.0]);
+        if transparent {
+            surface.fill_rect(photocraft_geom::Rect::new(16, 0, 32, 16), &[0.5]);
+        }
+        d.layers[0].mask = Some(LayerMask { surface, enabled: true, linked: true, density: 1.0, feather: 0.0 });
+    } else {
+        d.layers.push(Layer::new("Empty", LayerContent::Raster(Surface::new(d.pixel_format()))));
+    }
+    d
+}
+
+/// Reference the existing RGB composite and a direct CMS transform, independently of export's
+/// thread-local colour scope. The standard CMYK conversion uses the CMS lookup-table path;
+/// its exact pipeline can differ, especially for this test's coarse synthetic profile.
+fn cmyk_composite_pixels(d: &photocraft_doc::Document) -> Vec<Vec<f32>> {
+    use photocraft_cms::{Builtin, Intent, Profile, Transform};
+    let profile = Profile::parse(d.icc_profile.as_ref().unwrap()).unwrap();
+    let transform = Transform::new(Builtin::Srgb.profile(), &profile, Intent::RelativeColorimetric, true).unwrap();
+    let composite = photocraft_compose::flatten(d);
+    (0..3)
+        .map(|i| {
+            let p = composite.px[8 * d.size.width as usize + 16 * i + 8];
+            let mut ink = vec![0.0; 5];
+            transform.eval_fast(&p[..3], &mut ink[..4]);
+            ink[4] = p[3];
+            ink
+        })
+        .collect()
+}
+
+/// #2220: a second layer or a mask must not make a CMYK TIFF silently become RGB.
+#[test]
+fn cmyk_composite_tiff_keeps_mode_profile_depth_and_alpha() {
+    use photocraft_codecs::ChannelLayout;
+    for depth in [SampleType::U8, SampleType::U16, SampleType::F32] {
+        for masked in [false, true] {
+            for transparent in [false, true] {
+                let what = format!("{depth:?}, masked={masked}, transparent={transparent}");
+                let d = cmyk_composite_columns(depth, masked, transparent);
+                let r = export(&d, "a.tif", &ExportOptions::default()).unwrap();
+                let decoded = photocraft_codecs::decode(&r.bytes).unwrap();
+                assert_eq!(decoded.layout(), if transparent { ChannelLayout::CmykA } else { ChannelLayout::Cmyk }, "{what}");
+                assert!(r.warnings.iter().any(|w| w.contains("flattened")), "{what}: {:?}", r.warnings);
+                assert!(!r.warnings.iter().any(|w| w.contains("RGB")), "{what}: {:?}", r.warnings);
+                let back = import("a.tif", &r.bytes).unwrap().document;
+                assert_eq!((back.mode, back.depth, back.size), (ColorMode::Cmyk, depth, d.size), "{what}");
+                assert_eq!(back.icc_profile, d.icc_profile, "{what}");
+                let (got, want) = (column_pixels(&back, 3), cmyk_composite_pixels(&d));
+                let sample_tolerance = match depth {
+                    SampleType::U8 => 0.5 / 255.0,
+                    SampleType::U16 => 0.5 / 65535.0,
+                    SampleType::F32 => 1e-6,
+                };
+                assert_colors(&got, &want, sample_tolerance + 1e-6, &what);
+            }
+        }
+    }
+}
+
+#[test]
+fn cmyk_composite_jpeg_keeps_profile_and_mattes_inks_over_white() {
+    for depth in [SampleType::U8, SampleType::U16, SampleType::F32] {
+        for masked in [false, true] {
+            let what = format!("{depth:?}, masked={masked}");
+            let d = cmyk_composite_columns(depth, masked, true);
+            let r = export(&d, "a.jpg", &ExportOptions::default()).unwrap();
+            let back = import("a.jpg", &r.bytes).unwrap().document;
+            assert_eq!((back.mode, back.depth), (ColorMode::Cmyk, SampleType::U8), "{what}");
+            assert_eq!(back.icc_profile, d.icc_profile, "{what}");
+            assert!(r.warnings.iter().any(|w| w.contains("composited over white")), "{what}: {:?}", r.warnings);
+            assert!(!r.warnings.iter().any(|w| w.contains("RGB")), "{what}: {:?}", r.warnings);
+            let mut want = cmyk_composite_pixels(&d);
+            for pixel in &mut want {
+                let alpha = pixel[4];
+                for ink in &mut pixel[..4] {
+                    *ink *= alpha;
+                }
+                pixel[4] = 1.0;
+            }
+            assert_colors(&column_pixels(&back, 3), &want, 0.03, &what);
+        }
+    }
+}
+
+#[test]
+fn cmyk_composite_uses_document_profile_in_export_workers() {
+    use photocraft_cms::{Builtin, Intent, Transform};
+    let profile = photocraft_cms::synth::cmyk_profile(&photocraft_cms::synth::CmykParams {
+        description: "Test Uncoated".into(),
+        tvi: [0.26, 0.26, 0.26, 0.3],
+        grid_a2b: 5,
+        grid_b2a: 9,
+        ..Default::default()
+    });
+    let mut d = cmyk_composite_columns(SampleType::U16, false, true);
+    d.icc_profile = Some(profile.to_bytes());
+    let want = cmyk_composite_pixels(&d);
+    let composite = photocraft_compose::flatten(&d);
+    let rgb: Vec<Vec<f32>> = (0..3).map(|i| composite.px[8 * d.size.width as usize + 16 * i + 8].to_vec()).collect();
+    // Make sure this fixture detects accidentally using the built-in profile on worker threads.
+    let fallback = Transform::new(Builtin::Srgb.profile(), Builtin::CoatedCmyk.profile(), Intent::RelativeColorimetric, true).unwrap();
+    let mut other = [0.0; 4];
+    fallback.eval_fast(&rgb[1][..3], &mut other);
+    assert!(other.iter().zip(&want[1]).any(|(a, b)| (a - b).abs() > 0.02), "custom profile must change the separation");
+    let r = export(&d, "a.tif", &ExportOptions::default()).unwrap();
+    let back = import("a.tif", &r.bytes).unwrap().document;
+    assert_eq!(back.mode, ColorMode::Cmyk);
+    assert_eq!(back.icc_profile, d.icc_profile);
+    assert_colors(&column_pixels(&back, 3), &want, 1.0 / 65535.0, "custom CMYK TIFF");
+
+    // PNG cannot store CMYK. Keep the direct RGB composite, without an extra separation and
+    // conversion back to RGB that would lose colours and unnecessarily change the old output.
+    let r = export(&d, "a.png", &ExportOptions::default()).unwrap();
+    let back = import("a.png", &r.bytes).unwrap().document;
+    assert_eq!((back.mode, back.depth), (ColorMode::Rgb, SampleType::U16));
+    assert_eq!(back.icc_profile, Some(Builtin::Srgb.profile().to_bytes()));
+    let want: Vec<Vec<f32>> = rgb.into_iter().map(|p| p.into_iter().map(|v| v.clamp(0.0, 1.0)).collect()).collect();
+    assert_colors(&column_pixels(&back, 3), &want, 1.0 / 65535.0, "custom CMYK to PNG");
+}
+
 /// Formats without alpha get the document composited over white, as flattening does, instead of
 /// its alpha dropped (which shows the colours stored under transparent pixels).
 #[test]

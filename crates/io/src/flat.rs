@@ -153,6 +153,12 @@ pub(crate) fn csample(s: SampleType) -> CSample {
 
 /// Renders the document to a flat codec image (native pixels when possible).
 pub fn document_to_image(doc: &Document, warnings: &mut Vec<String>) -> Result<Image, IoError> {
+    document_to_image_with_cmyk(doc, warnings, true)
+}
+
+/// Destinations without CMYK support use the RGB composite directly, avoiding an unnecessary
+/// RGB → CMYK → RGB round trip. The native single-layer path keeps its original samples.
+fn document_to_image_with_cmyk(doc: &Document, warnings: &mut Vec<String>, keep_cmyk: bool) -> Result<Image, IoError> {
     let (w, h) = (doc.size.width, doc.size.height);
     let canvas = doc.bounds();
     let fmt = doc.pixel_format();
@@ -187,16 +193,25 @@ pub fn document_to_image(doc: &Document, warnings: &mut Vec<String>) -> Result<I
     } else {
         let count = doc.layer_count();
         warnings.push(format!("{count} layer(s) flattened; layers, masks and blend modes are not kept"));
-        // The compositor works in RGB; write RGB/gray.
+        // The compositor works in RGB. CMYK-capable outputs separate its result through the
+        // document profile, as PSD does; this does not preserve the original ink separations.
         let gray = fmt.mode == ColorMode::Grayscale;
-        if fmt.mode == ColorMode::Cmyk || fmt.mode == ColorMode::Lab {
-            // The compositor renders CMYK/Lab documents in sRGB (CMYK through the built-in
-            // profile), so the file is tagged sRGB.
+        let cmyk = fmt.mode == ColorMode::Cmyk && keep_cmyk;
+        let space = if cmyk { photocraft_compose::cmyk_space(doc) } else { None };
+        if (fmt.mode == ColorMode::Cmyk && !cmyk) || fmt.mode == ColorMode::Lab {
+            // CMYK/Lab composites are in sRGB, so RGB output must be tagged accordingly.
             warnings.push(format!("{:?} composite written as sRGB RGB (colour-managed conversion)", fmt.mode));
             icc = Some(photocraft_cms::Builtin::Srgb.profile().to_bytes().to_vec());
         }
         let cs = csample(fmt.sample);
-        let colors = if gray { 1 } else { 3 };
+        let mode = if cmyk {
+            ColorMode::Cmyk
+        } else if gray {
+            ColorMode::Grayscale
+        } else {
+            ColorMode::Rgb
+        };
+        let colors = mode.color_channels();
         // Rendered and quantised in bands (no full-size float composite), with alpha; the alpha
         // is dropped afterwards, in place, when every pixel turned out opaque.
         let mut data = try_buffer(n, (colors + 1) * cs.bytes())?;
@@ -204,26 +219,33 @@ pub fn document_to_image(doc: &Document, warnings: &mut Vec<String>) -> Result<I
         let _ = photocraft_compose::render_bands(doc, canvas, 0, |band| -> Result<(), ()> {
             opaque &= band.px.iter().all(|p| p[3] >= 1.0);
             let parts = crate::pixels::par_map(crate::pixels::bands(band.px.len()), |range| {
-                let mut out = Vec::with_capacity(range.len() * (colors + 1) * cs.bytes());
-                let mut put = |v: f32| {
-                    let v = if v.is_nan() { 0.0 } else { v };
-                    match cs {
-                        CSample::U8 => out.push((v.clamp(0.0, 1.0) * 255.0).round() as u8),
-                        CSample::U16 => out.extend_from_slice(&((v.clamp(0.0, 1.0) * 65535.0).round() as u16).to_ne_bytes()),
-                        CSample::F16 | CSample::F32 => out.extend_from_slice(&v.to_ne_bytes()),
+                // CMYK profile scope is thread-local, so every parallel worker enters it.
+                photocraft_color::convert::with_cmyk_space(space.as_ref(), || {
+                    let mut out = Vec::with_capacity(range.len() * (colors + 1) * cs.bytes());
+                    let mut put = |v: f32| {
+                        let v = if v.is_nan() { 0.0 } else { v };
+                        match cs {
+                            CSample::U8 => out.push((v.clamp(0.0, 1.0) * 255.0).round() as u8),
+                            CSample::U16 => out.extend_from_slice(&((v.clamp(0.0, 1.0) * 65535.0).round() as u16).to_ne_bytes()),
+                            CSample::F16 | CSample::F32 => out.extend_from_slice(&v.to_ne_bytes()),
+                        }
+                    };
+                    for p in &band.px[range] {
+                        if gray {
+                            put(photocraft_color::convert::rgb_to_gray([p[0], p[1], p[2]]));
+                        } else if cmyk {
+                            for ink in photocraft_color::convert::rgb_to_cmyk([p[0], p[1], p[2]]) {
+                                put(ink);
+                            }
+                        } else {
+                            put(p[0]);
+                            put(p[1]);
+                            put(p[2]);
+                        }
+                        put(p[3]);
                     }
-                };
-                for p in &band.px[range] {
-                    if gray {
-                        put(photocraft_color::convert::rgb_to_gray([p[0], p[1], p[2]]));
-                    } else {
-                        put(p[0]);
-                        put(p[1]);
-                        put(p[2]);
-                    }
-                    put(p[3]);
-                }
-                out
+                    out
+                })
             });
             for part in parts {
                 data.extend_from_slice(&part);
@@ -233,7 +255,7 @@ pub fn document_to_image(doc: &Document, warnings: &mut Vec<String>) -> Result<I
         if opaque {
             drop_alpha(&mut data, colors * cs.bytes(), cs.bytes());
         }
-        let layout = layout_for(if gray { ColorMode::Grayscale } else { ColorMode::Rgb }, !opaque);
+        let layout = layout_for(mode, !opaque);
         Image::from_raw(w, h, layout, cs, data)?
     };
     let meta = codecs::Metadata {
@@ -293,7 +315,8 @@ pub fn export_flat(doc: &Document, format: Format, opts: &ExportOptions) -> Resu
         return Ok(r);
     }
     let mut warnings = Vec::new();
-    let mut img = document_to_image(doc, &mut warnings)?;
+    let keep_cmyk = format.caps().layouts.iter().any(|l| l.is_cmyk());
+    let mut img = document_to_image_with_cmyk(doc, &mut warnings, keep_cmyk)?;
     if opts.xmp == XmpEmbed::None {
         // Export As's Metadata: None: the packet lists the text of every type layer and one id
         // per placed document (#647).
