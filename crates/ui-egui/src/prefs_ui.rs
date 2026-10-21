@@ -2646,6 +2646,7 @@ mod tests {
         for key in ["jpegQuality", "webpLossless", "webpQuality", "convertToSrgb", "metadata"] {
             assert!(!export_field_visible(&obj, key), "EXR must not offer ignored web settings: {key}");
         }
+        assert!(export_field_visible(&obj, "quickExportLocation"));
     }
 
     #[test]
